@@ -2,7 +2,7 @@
 name = "domain_status"
 version = "0.1.10"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Alex Woolford <alex@woolford.io>"]
 description = "Concurrent URL status checker that captures comprehensive metadata in SQLite."
 license = "MIT"
