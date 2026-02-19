@@ -12,6 +12,7 @@
 pub mod enrichment;
 pub mod failure;
 mod record;
+pub mod retry;
 mod run;
 pub mod url;
 mod utils;

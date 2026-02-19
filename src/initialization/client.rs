@@ -14,9 +14,16 @@ use reqwest::ClientBuilder;
 /// Creates a `reqwest::Client` configured with:
 /// - User-Agent header from options
 /// - Timeout from options
-/// - Redirect following enabled (up to 10 hops)
+/// - Redirect following DISABLED (SSRF protection)
 /// - HTTP/2 support enabled
 /// - Rustls TLS backend (no native TLS)
+///
+/// # Security Note
+///
+/// Redirects are disabled to prevent SSRF bypass via TOCTOU race conditions.
+/// Redirect chains are manually resolved by `resolve_redirect_chain()` with SSRF
+/// validation at each hop. If this client followed redirects automatically,
+/// a malicious server could redirect to internal IPs after validation.
 ///
 /// # Arguments
 ///
@@ -34,7 +41,11 @@ pub async fn init_client(config: &Config) -> Result<Arc<reqwest::Client>, reqwes
 
     // Always allow invalid certificates to maximize data capture
     // Certificate issues will be recorded as security warnings
+    // SECURITY: Disable redirects to prevent SSRF bypass via TOCTOU race conditions.
+    // After resolve_redirect_chain() validates the redirect chain, if this client
+    // followed redirects, a malicious server could redirect to an internal IP.
     let client = ClientBuilder::new()
+        .redirect(reqwest::redirect::Policy::none()) // SECURITY: Prevent SSRF bypass
         .timeout(Duration::from_secs(config.timeout_seconds))
         .connect_timeout(Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS)) // FIX: Enforce TCP connect timeout
         .user_agent(config.user_agent.clone())
@@ -197,5 +208,102 @@ mod tests {
         config.timeout_seconds = 0;
         let result = init_redirect_client(&config).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_init_client_does_not_follow_redirects() {
+        // CRITICAL SECURITY TEST: Verify the main client does NOT follow redirects.
+        // This prevents SSRF bypass via TOCTOU race conditions.
+        // After resolve_redirect_chain() validates the redirect chain, if the main client
+        // followed redirects, a malicious server could redirect to an internal IP.
+        use httptest::{matchers::*, responders::*, Expectation, Server};
+
+        let server = Server::run();
+        let redirect_url = format!("http://{}/redirect", server.addr());
+        let target_url = format!("http://{}/target", server.addr());
+
+        // Set up server to return 302 redirect
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/redirect"))
+                .respond_with(status_code(302).insert_header("Location", target_url.clone())),
+        );
+
+        // The target should NOT be hit if redirects are disabled
+        // (we don't add an expectation for /target)
+
+        let config = create_test_config();
+        let client = init_client(&config).await.expect("Should create client");
+
+        // Make request to the redirect URL
+        let response = client
+            .get(&redirect_url)
+            .send()
+            .await
+            .expect("Should send request");
+
+        // Verify we got the 302 status (not followed to target)
+        assert_eq!(
+            response.status().as_u16(),
+            302,
+            "Main client should NOT follow redirects - got status {} instead of 302",
+            response.status().as_u16()
+        );
+
+        // Verify the URL is still the redirect URL (not the target)
+        assert_eq!(
+            response.url().path(),
+            "/redirect",
+            "Main client should NOT follow redirects"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_both_clients_have_redirects_disabled() {
+        // Verify that both init_client and init_redirect_client have redirects disabled
+        // This is critical for SSRF protection
+        use httptest::{matchers::*, responders::*, Expectation, Server};
+
+        let server = Server::run();
+        let redirect_url = format!("http://{}/redirect", server.addr());
+        let target_url = format!("http://{}/target", server.addr());
+
+        // Set up two expectations - one for each client
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/redirect"))
+                .times(2..) // Both clients will hit this
+                .respond_with(status_code(302).insert_header("Location", target_url.clone())),
+        );
+
+        let config = create_test_config();
+        let main_client = init_client(&config)
+            .await
+            .expect("Should create main client");
+        let redirect_client = init_redirect_client(&config)
+            .await
+            .expect("Should create redirect client");
+
+        // Test main client
+        let main_response = main_client
+            .get(&redirect_url)
+            .send()
+            .await
+            .expect("Main client should send request");
+        assert_eq!(
+            main_response.status().as_u16(),
+            302,
+            "Main client should not follow redirects"
+        );
+
+        // Test redirect client
+        let redirect_response = redirect_client
+            .get(&redirect_url)
+            .send()
+            .await
+            .expect("Redirect client should send request");
+        assert_eq!(
+            redirect_response.status().as_u16(),
+            302,
+            "Redirect client should not follow redirects"
+        );
     }
 }

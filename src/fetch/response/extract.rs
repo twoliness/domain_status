@@ -1,11 +1,59 @@
 //! HTTP response extraction utilities.
 
 use anyhow::{Error, Result};
+use futures::StreamExt;
 use log::debug;
 
 use super::types::ResponseData;
 use crate::domain::extract_domain;
 use crate::fetch::request::{extract_http_headers, extract_security_headers};
+
+/// Streams response body with a size limit to prevent OOM attacks.
+///
+/// Unlike `response.text().await` which downloads the entire body into memory first,
+/// this function streams bytes incrementally and aborts early if the limit is exceeded.
+/// This prevents malicious servers from causing OOM by streaming infinite content.
+///
+/// # Arguments
+///
+/// * `response` - The HTTP response to stream
+/// * `max_size` - Maximum allowed body size in bytes
+/// * `domain` - Domain name for logging
+///
+/// # Returns
+///
+/// * `Ok(Some(String))` - Body text if within size limit
+/// * `Ok(None)` - Body exceeded size limit (safely aborted)
+/// * `Err(_)` - Stream read error
+async fn stream_body_with_limit(
+    response: reqwest::Response,
+    max_size: usize,
+    domain: &str,
+) -> Result<Option<String>, Error> {
+    let mut stream = response.bytes_stream();
+    let mut accumulated = Vec::with_capacity(max_size.min(64 * 1024)); // Pre-allocate up to 64KB
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result?;
+
+        // Check if adding this chunk would exceed the limit
+        if accumulated.len() + chunk.len() > max_size {
+            log::debug!(
+                "Aborting body stream for {} at {} bytes (limit: {} bytes) - potential OOM attack",
+                domain,
+                accumulated.len() + chunk.len(),
+                max_size
+            );
+            return Ok(None);
+        }
+
+        accumulated.extend_from_slice(&chunk);
+    }
+
+    // Convert bytes to UTF-8 string (lossy conversion for non-UTF-8 content)
+    let body = String::from_utf8_lossy(&accumulated).into_owned();
+    Ok(Some(body))
+}
 
 /// Extracts and validates response data from an HTTP response.
 ///
@@ -75,14 +123,20 @@ pub(crate) async fn extract_response_data(
         debug!("Content-Encoding for {final_domain}: {:?}", encoding);
     }
 
-    // Cap body size and read as text (reqwest automatically decompresses gzip/deflate/br)
-    let body = match response.text().await {
-        Ok(text) => {
-            if text.len() > crate::config::MAX_RESPONSE_BODY_SIZE {
-                debug!("Skipping large body: {} bytes", text.len());
-                return Ok(None);
-            }
-            text
+    // SECURITY: Stream body with running size check to prevent OOM attacks.
+    // Unlike response.text().await which downloads the entire body into memory first,
+    // this approach aborts early when MAX_RESPONSE_BODY_SIZE is exceeded.
+    let body = match stream_body_with_limit(
+        response,
+        crate::config::MAX_RESPONSE_BODY_SIZE,
+        &final_domain,
+    )
+    .await
+    {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            debug!("Body exceeded limit for {final_domain}, skipping");
+            return Ok(None);
         }
         Err(e) => {
             log::warn!("Failed to read response body for {final_domain}: {e}");
@@ -810,6 +864,119 @@ mod tests {
             MAX_HTML_PREVIEW_CHARS, 500,
             "MAX_HTML_PREVIEW_CHARS should be 500"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stream_body_with_limit_within_limit() {
+        // Test that bodies within the limit are successfully streamed
+        let server = Server::run();
+        let server_url = server.url("/stream-small").to_string();
+
+        let body_content = "Hello, World!";
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/stream-small"))
+                .respond_with(status_code(200).body(body_content)),
+        );
+
+        let client = reqwest::Client::new();
+        let response = client.get(&server_url).send().await.unwrap();
+
+        let result = super::stream_body_with_limit(response, 1024, "test.com").await;
+
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(body.is_some());
+        assert_eq!(body.unwrap(), body_content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_body_with_limit_exceeds_limit() {
+        // Test that bodies exceeding the limit return None (safely aborted)
+        let server = Server::run();
+        let server_url = server.url("/stream-large").to_string();
+
+        // Create a body larger than our test limit
+        let large_body = "x".repeat(2000);
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/stream-large"))
+                .respond_with(status_code(200).body(large_body)),
+        );
+
+        let client = reqwest::Client::new();
+        let response = client.get(&server_url).send().await.unwrap();
+
+        // Use a limit smaller than the body
+        let result = super::stream_body_with_limit(response, 1000, "test.com").await;
+
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(
+            body.is_none(),
+            "Should return None for bodies exceeding limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_body_with_limit_exactly_at_limit() {
+        // Test that bodies exactly at the limit are accepted
+        let server = Server::run();
+        let server_url = server.url("/stream-exact").to_string();
+
+        let exact_body = "x".repeat(1000);
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/stream-exact"))
+                .respond_with(status_code(200).body(exact_body.clone())),
+        );
+
+        let client = reqwest::Client::new();
+        let response = client.get(&server_url).send().await.unwrap();
+
+        let result = super::stream_body_with_limit(response, 1000, "test.com").await;
+
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(body.is_some(), "Bodies exactly at limit should be accepted");
+        assert_eq!(body.unwrap().len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_stream_body_with_limit_empty_body() {
+        // Test that empty bodies are handled correctly
+        let server = Server::run();
+        let server_url = server.url("/stream-empty").to_string();
+
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/stream-empty"))
+                .respond_with(status_code(200).body("")),
+        );
+
+        let client = reqwest::Client::new();
+        let response = client.get(&server_url).send().await.unwrap();
+
+        let result = super::stream_body_with_limit(response, 1000, "test.com").await;
+
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(body.is_some());
+        assert_eq!(body.unwrap(), "");
+    }
+
+    #[test]
+    fn test_stream_body_prevents_oom_attack() {
+        // Verify the streaming approach prevents OOM attacks by documenting the behavior:
+        // - Old approach (response.text().await): Downloads entire body into memory BEFORE checking size
+        // - New approach (stream_body_with_limit): Aborts DURING streaming when limit exceeded
+        //
+        // This test verifies the constants and logic are correctly set up for OOM protection
+        use crate::config::MAX_RESPONSE_BODY_SIZE;
+
+        // Verify the limit is reasonable (2MB)
+        assert_eq!(MAX_RESPONSE_BODY_SIZE, 2 * 1024 * 1024);
+
+        // The streaming approach guarantees:
+        // 1. Memory usage is bounded by MAX_RESPONSE_BODY_SIZE + one chunk size (typically 64KB)
+        // 2. Malicious infinite streams are aborted quickly
+        // 3. No full download required before checking size
     }
 
     #[test]

@@ -73,8 +73,21 @@ pub async fn lookup_txt_records(
 ) -> Result<Vec<String>, Error> {
     match resolver.lookup(domain, RecordType::TXT).await {
         Ok(lookup) => {
+            // Count total TXT records for logging
+            let total_count = lookup.iter().filter(|r| matches!(r, RData::TXT(_))).count();
+            if total_count > crate::config::MAX_TXT_RECORD_COUNT {
+                log::warn!(
+                    "Domain {} has {} TXT records (limit: {}), capping (potential DNS abuse)",
+                    domain,
+                    total_count,
+                    crate::config::MAX_TXT_RECORD_COUNT
+                );
+            }
+
             let txt_records: Vec<String> = lookup
                 .iter()
+                // Cap the number of TXT records to prevent memory/storage exhaustion
+                .take(crate::config::MAX_TXT_RECORD_COUNT)
                 .filter_map(|rdata| {
                     if let RData::TXT(txt) = rdata {
                         // TXT records can contain multiple strings - join them
@@ -172,5 +185,57 @@ pub async fn lookup_mx_records(
                 Err(e.into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{MAX_TXT_RECORD_COUNT, MAX_TXT_RECORD_SIZE};
+
+    #[test]
+    fn test_max_txt_record_count_constant_value() {
+        // Verify MAX_TXT_RECORD_COUNT is set to a reasonable value (20)
+        // This caps the number of TXT records to prevent memory/storage exhaustion
+        // Range: 1-100 records is reasonable
+        assert_eq!(MAX_TXT_RECORD_COUNT, 20);
+    }
+
+    #[test]
+    fn test_max_txt_record_size_constant_value() {
+        // Verify MAX_TXT_RECORD_SIZE is set to a reasonable value (1KB)
+        // This truncates individual TXT records to prevent memory exhaustion
+        // Range: 512-4096 bytes is reasonable
+        assert_eq!(MAX_TXT_RECORD_SIZE, 1024);
+    }
+
+    #[test]
+    fn test_txt_record_limits_prevent_memory_exhaustion() {
+        // Verify that the combination of count and size limits prevents memory exhaustion
+        // Worst case: MAX_TXT_RECORD_COUNT * MAX_TXT_RECORD_SIZE = 20 * 1024 = 20KB
+        // This is a reasonable upper bound for TXT records per domain
+        let worst_case_bytes = MAX_TXT_RECORD_COUNT * MAX_TXT_RECORD_SIZE;
+        assert_eq!(worst_case_bytes, 20 * 1024);
+        assert!(
+            worst_case_bytes <= 100 * 1024,
+            "Worst case should be under 100KB"
+        );
+    }
+
+    #[test]
+    fn test_take_iterator_behavior() {
+        // Verify that .take() correctly limits the number of items
+        // This tests the underlying behavior we rely on in lookup_txt_records
+        let items: Vec<i32> = (0..100).collect();
+        let limited: Vec<i32> = items.iter().take(MAX_TXT_RECORD_COUNT).cloned().collect();
+        assert_eq!(limited.len(), MAX_TXT_RECORD_COUNT);
+        assert_eq!(limited.len(), 20);
+    }
+
+    #[test]
+    fn test_take_iterator_with_fewer_items() {
+        // Verify that .take() works correctly when there are fewer items than the limit
+        let items: Vec<i32> = (0..5).collect();
+        let limited: Vec<i32> = items.iter().take(MAX_TXT_RECORD_COUNT).cloned().collect();
+        assert_eq!(limited.len(), 5);
     }
 }

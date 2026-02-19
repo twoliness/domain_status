@@ -8,6 +8,7 @@ use sqlx::{Row, SqlitePool};
 use crate::error_handling::DatabaseError;
 
 use super::super::models::{UrlFailureRecord, UrlPartialFailureRecord};
+use super::retry::with_sqlite_retry;
 use super::utils::insert_key_value_batch;
 
 /// Inserts a URL failure record into the database with retry logic.
@@ -30,35 +31,7 @@ pub async fn insert_url_failure(
     pool: &SqlitePool,
     failure: &UrlFailureRecord,
 ) -> Result<i64, DatabaseError> {
-    // Retry strategy for transient database errors (SQLITE_BUSY, SQLITE_LOCKED)
-    const MAX_RETRIES: usize = 3;
-    const INITIAL_DELAY_MS: u64 = 50;
-
-    for attempt in 0..=MAX_RETRIES {
-        match insert_url_failure_impl(pool, failure).await {
-            Ok(id) => return Ok(id),
-            Err(e) => {
-                // Check if error is retriable (transient database errors)
-                let is_retriable = matches!(
-                    &e,
-                    DatabaseError::SqlError(sqlx::Error::Database(db_err))
-                        if db_err.message().contains("database is locked")
-                            || db_err.message().contains("database is busy")
-                );
-
-                if !is_retriable || attempt >= MAX_RETRIES {
-                    return Err(e);
-                }
-
-                // Exponential backoff: 50ms, 100ms, 200ms
-                let delay_ms = INITIAL_DELAY_MS * (1 << attempt);
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-        }
-    }
-
-    // Should never reach here, but handle it gracefully
-    Err(DatabaseError::SqlError(sqlx::Error::PoolClosed))
+    with_sqlite_retry(|| insert_url_failure_impl(pool, failure)).await
 }
 
 /// Inserts redirect chain for a failure record.

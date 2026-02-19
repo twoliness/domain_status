@@ -1,6 +1,6 @@
 [package]
 name = "domain_status"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Alex Woolford <alex@woolford.io>"]
@@ -44,7 +44,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # HTTP requests and async (use rustls only; drop native-tls)
-reqwest = { version = "^0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "deflate"] }
+reqwest = { version = "^0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "deflate", "stream"] }
 http = "^1.4" # Updated for wappalyzer compatibility
 tokio = { version = "^1", features = ["full"] }
 tokio-util = "^0.7"
@@ -84,6 +84,7 @@ csv = "^1.3"
 regex = "^1.12"
 once_cell = "^1.21"
 lru = "^0.16"
+moka = { version = "^0.12", features = ["sync"] }
 tempfile = "^3.24"
 maxminddb = "^0.27"
 flate2 = "^1.1"
@@ -101,8 +102,8 @@ sha2 = "^0.10"
 
 [dev-dependencies]
 httptest = "^0.16"
-proptest = "1.4"           # Property-based testing
-insta = { version = "1.38", features = ["yaml"] }  # Snapshot/golden testing
-pretty_assertions = "1.4"   # Better test output
-assert_cmd = "2.0"          # CLI testing
-wiremock = "0.6"            # HTTP mocking for integration tests
+proptest = "^1.4"          # Property-based testing
+insta = { version = "^1.38", features = ["yaml"] }  # Snapshot/golden testing
+pretty_assertions = "^1.4"  # Better test output
+assert_cmd = "^2.0"         # CLI testing
+wiremock = "^0.6"           # HTTP mocking for integration tests

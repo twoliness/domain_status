@@ -5,11 +5,9 @@
 //! - Regex pattern matching
 //! - Meta tag pattern matching with prefix support
 
-use lru::LruCache;
+use moka::sync::Cache;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
 
 /// Maximum number of compiled regex patterns to cache.
 ///
@@ -21,18 +19,17 @@ use std::sync::{Arc, Mutex};
 /// - Only regex patterns (containing special chars) need compilation and caching
 /// - Typical production usage sees ~1000-3000 unique regex patterns
 /// - 10k provides ample headroom without memory concerns (each compiled regex is ~1-5KB)
-const MAX_REGEX_CACHE_SIZE: usize = 10_000;
+const MAX_REGEX_CACHE_SIZE: u64 = 10_000;
 
 /// Global cache for compiled regex patterns.
 /// This cache is shared across all threads and persists for the lifetime of the program.
 /// Regex compilation is expensive (10-100x slower than matching), so caching provides
 /// significant performance improvements when the same patterns are used repeatedly.
-/// Uses LRU eviction to prevent unbounded memory growth.
-static REGEX_CACHE: Lazy<Arc<Mutex<LruCache<String, regex::Regex>>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(LruCache::new(
-        NonZeroUsize::new(MAX_REGEX_CACHE_SIZE).unwrap(),
-    )))
-});
+///
+/// Uses moka's lock-free concurrent cache for high-throughput concurrent access,
+/// avoiding the mutex contention that would occur with `std::sync::Mutex<LruCache>`.
+static REGEX_CACHE: Lazy<Cache<String, regex::Regex>> =
+    Lazy::new(|| Cache::new(MAX_REGEX_CACHE_SIZE));
 
 /// Result of meta pattern matching with optional version
 #[derive(Debug, Clone)]
@@ -268,7 +265,7 @@ fn is_regex_pattern(pattern: &str) -> bool {
 /// Gets or compiles a regex pattern with caching.
 ///
 /// Returns the compiled regex, or `None` if compilation fails.
-/// Handles mutex poisoning gracefully.
+/// Uses moka's lock-free concurrent cache for high-throughput access.
 ///
 /// # Arguments
 ///
@@ -282,36 +279,19 @@ fn get_or_compile_regex(pattern: &str, cache_key: &str) -> Option<regex::Regex> 
     // wappalyzergo uses case-insensitive matching: regexp.Compile("(?i)" + regexPattern)
     let case_insensitive_pattern = format!("(?i){}", pattern);
 
-    // Handle mutex poisoning gracefully - if poisoned, recover by getting the inner value
-    let mut cache = REGEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Check cache first (LRU automatically promotes accessed items to most recently used)
-    if let Some(cached) = cache.get(cache_key) {
-        return Some(cached.clone());
+    // Try to get from cache first (lock-free read)
+    if let Some(cached) = REGEX_CACHE.get(cache_key) {
+        return Some(cached);
     }
-    drop(cache); // Release lock before compilation
 
     // Compile regex (this is expensive, so we cache it)
+    // moka handles concurrent access automatically - if multiple threads try to
+    // compile the same pattern simultaneously, all will succeed and one wins the cache
     match regex::Regex::new(&case_insensitive_pattern) {
         Ok(re) => {
-            // Cache the compiled regex (LRU automatically evicts least recently used if full)
-            let mut cache = REGEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            // Check again in case another thread compiled it while we were waiting
-            if let Some(cached) = cache.get(cache_key) {
-                Some(cached.clone())
-            } else {
-                let re_clone = re.clone();
-                // LRU cache: put() returns Some((key, value)) if an entry was evicted
-                // This happens automatically when cache is full - the least recently used entry
-                // is removed to make room for the new one
-                if let Some(_evicted) = cache.put(cache_key.to_string(), re) {
-                    log::debug!(
-                        "Regex cache evicted least recently used pattern (cache full, capacity: {})",
-                        MAX_REGEX_CACHE_SIZE
-                    );
-                }
-                Some(re_clone)
-            }
+            // Cache the compiled regex (moka handles eviction automatically)
+            REGEX_CACHE.insert(cache_key.to_string(), re.clone());
+            Some(re)
         }
         Err(_) => None, // Compilation failed
     }
@@ -626,10 +606,8 @@ mod tests {
     use super::*;
 
     /// Clears the regex cache (useful for testing).
-    /// Handles mutex poisoning gracefully.
     fn clear_regex_cache() {
-        let mut cache = REGEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        cache.clear();
+        REGEX_CACHE.invalidate_all();
     }
 
     #[test]
@@ -837,9 +815,8 @@ mod tests {
         );
 
         // Verify cache is populated
-        let mut cache = REGEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
-            cache.get("^nginx").is_some(),
+            REGEX_CACHE.get("^nginx").is_some(),
             "Cache should contain compiled regex for '^nginx'"
         );
     }

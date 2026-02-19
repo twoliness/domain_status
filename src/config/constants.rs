@@ -35,6 +35,12 @@ pub const DNS_TIMEOUT_SECS: u64 = 3;
 /// TXT records exceeding this limit are truncated with a warning logged
 pub const MAX_TXT_RECORD_SIZE: usize = 1024;
 
+/// Maximum number of TXT records to process per domain
+/// Prevents memory/storage exhaustion from malicious DNS servers returning thousands of TXT records
+/// Most legitimate domains have 1-5 TXT records (SPF, DMARC, DKIM, domain verification)
+/// 20 provides generous headroom while capping the worst-case scenario
+pub const MAX_TXT_RECORD_COUNT: usize = 20;
+
 /// TCP connection timeout in seconds
 pub const TCP_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// TLS handshake timeout in seconds
@@ -147,6 +153,10 @@ pub const MAX_NETWORK_DOWNLOAD_RETRIES: usize = 3;
 pub const FINGERPRINT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// WHOIS cache TTL: 7 days (WHOIS data changes infrequently)
 pub const WHOIS_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Maximum number of WHOIS cache entries (files) to maintain
+/// Prevents unbounded disk usage and filesystem performance degradation
+/// when scanning 100K+ domains. Oldest entries are evicted when limit is reached.
+pub const MAX_WHOIS_CACHE_ENTRIES: usize = 50_000;
 /// User-Agent cache TTL: 30 days
 /// Chrome releases roughly every 4 weeks, so 30 days ensures we stay current
 pub const USER_AGENT_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;

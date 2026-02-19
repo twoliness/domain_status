@@ -18,9 +18,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use log::warn;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{log_progress, validate_and_normalize_url};
@@ -131,11 +130,27 @@ pub async fn run_scan(config: crate::config::Config) -> Result<ScanReport> {
     }
 
     // Phase 3: Run the main scan loop
-    let mut tasks = FuturesUnordered::new();
+    // Use JoinSet instead of FuturesUnordered for better memory efficiency.
+    // JoinSet allows interleaved spawning and reaping, preventing memory accumulation
+    // when processing large URL lists (1M+ URLs).
+    let mut tasks: JoinSet<()> = JoinSet::new();
     let mut consecutive_errors = 0;
     const MAX_CONSECUTIVE_ERRORS: usize = 10;
 
     loop {
+        // Interleaved reaping: Try to reap any completed tasks before spawning new ones.
+        // This prevents JoinHandle accumulation when tasks complete faster than new ones are read.
+        // Using timeout(Duration::ZERO) for non-blocking check - if a task is ready, we get it;
+        // otherwise we immediately continue to spawn new tasks.
+        while let Ok(Some(task_result)) =
+            tokio::time::timeout(std::time::Duration::ZERO, tasks.join_next()).await
+        {
+            if let Err(join_error) = task_result {
+                resources.failed_urls.fetch_add(1, Ordering::SeqCst);
+                log::warn!("Failed to join task (panicked): {:?}", join_error);
+            }
+        }
+
         let line_result = url_source.next_line().await;
         let line = match line_result {
             Ok(Some(line)) => {
@@ -190,7 +205,9 @@ pub async fn run_scan(config: crate::config::Config) -> Result<ScanReport> {
             progress_callback: progress_callback.clone(),
         };
 
-        tasks.push(tokio::spawn(task::process_url_task(task_params)));
+        // JoinSet::spawn() is like FuturesUnordered::push(tokio::spawn(...))
+        // but manages the JoinHandle internally without accumulating them all in memory
+        tasks.spawn(task::process_url_task(task_params));
     }
 
     // Phase 4: Set up logging and drain tasks
@@ -235,8 +252,8 @@ pub async fn run_scan(config: crate::config::Config) -> Result<ScanReport> {
         }))
     };
 
-    // Drain all tasks
-    while let Some(task_result) = tasks.next().await {
+    // Drain all remaining tasks (blocking wait until all complete)
+    while let Some(task_result) = tasks.join_next().await {
         if let Err(join_error) = task_result {
             resources.failed_urls.fetch_add(1, Ordering::SeqCst);
             log::warn!("Failed to join task (panicked): {:?}", join_error);
@@ -257,6 +274,95 @@ mod tests {
     use super::*;
     use crate::config::{Config, FailOn, LogFormat, LogLevel};
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_joinset_interleaved_reaping() {
+        // Test that JoinSet correctly handles interleaved spawning and reaping
+        // This validates our migration from FuturesUnordered to JoinSet
+        let mut tasks: JoinSet<i32> = JoinSet::new();
+
+        // Spawn a few tasks
+        for i in 0..5 {
+            tasks.spawn(async move { i });
+        }
+
+        // Reap completed tasks using the same pattern as run_scan
+        let mut results = Vec::new();
+        while let Ok(Some(result)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), tasks.join_next()).await
+        {
+            if let Ok(value) = result {
+                results.push(value);
+            }
+        }
+
+        // All tasks should have completed
+        assert_eq!(results.len(), 5, "Should have reaped all 5 tasks");
+
+        // Verify JoinSet is empty
+        assert!(
+            tasks.is_empty(),
+            "JoinSet should be empty after draining all tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_joinset_handles_panicked_tasks() {
+        // Test that JoinSet correctly surfaces panicked tasks (important for error handling)
+        let mut tasks: JoinSet<()> = JoinSet::new();
+
+        // Spawn a task that will panic
+        tasks.spawn(async {
+            panic!("intentional panic for testing");
+        });
+
+        // Spawn a normal task
+        tasks.spawn(async {});
+
+        // Drain and verify we get the panic error
+        let mut panics = 0;
+        let mut successes = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(()) => successes += 1,
+                Err(_join_error) => panics += 1,
+            }
+        }
+
+        assert_eq!(panics, 1, "Should have captured 1 panicked task");
+        assert_eq!(successes, 1, "Should have captured 1 successful task");
+    }
+
+    #[tokio::test]
+    async fn test_joinset_zero_timeout_non_blocking() {
+        // Test that Duration::ZERO timeout is truly non-blocking
+        // This is critical for the interleaved reaping pattern in run_scan
+        let mut tasks: JoinSet<()> = JoinSet::new();
+
+        // Spawn a task that takes a long time
+        tasks.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        // Zero timeout should return immediately (no waiting for the long task)
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::ZERO, tasks.join_next()).await;
+        let elapsed = start.elapsed();
+
+        // Should have timed out (Err) or returned None very quickly
+        assert!(
+            result.is_err() || matches!(result, Ok(None)),
+            "Zero timeout should not block waiting for long task"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "Zero timeout should return almost immediately, took {:?}",
+            elapsed
+        );
+
+        // Cleanup: abort the long-running task
+        tasks.abort_all();
+    }
 
     #[tokio::test]
     async fn test_run_scan_validation_failure() {

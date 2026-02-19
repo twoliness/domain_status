@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-02-18
+
+### Added
+- Resource limits: MAX_TXT_RECORD_COUNT (20) to prevent DNS record abuse
+- Resource limits: MAX_WHOIS_CACHE_ENTRIES (50K) with LRU eviction to cap disk usage
+- SQLite retry module with exponential backoff for SQLITE_BUSY/LOCKED errors
+- Comprehensive tests for retry logic, TXT record limits, and WHOIS cache eviction
+
+### Changed
+- Standardized all dependency versions to ^x.y format for consistent patch updates
+- Simplified constant validation tests by removing redundant assertions
+- Refactored run_scan module to reduce complexity
+- Introduced type-safe enums for export functionality
+
+### Fixed
+- Clippy warnings: too_many_lines, assertions_on_constants, identity_op
+- Documentation: Fixed broken links and improved clarity
+
+### Dependencies
+- Updated futures: 0.3.31 → 0.3.32 (performance improvements)
+- Updated clap: 4.5.57 → 4.5.59 (bug fixes)
+- Updated env_logger: 0.11.8 → 0.11.9
+- Updated maxminddb: 0.27.1 → 0.27.3 (performance improvements)
+- Updated psl: 2.1.189 → 2.1.192 (public suffix list updates)
+
 ## [0.1.10] - 2026-02-11
 
 ### Added
@@ -92,7 +117,8 @@ Initial public release.
 - Security audit with `cargo-audit` in CI pipeline
 - URL validation to prevent SSRF attacks
 
-[Unreleased]: https://github.com/alexwoolford/domain_status/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/alexwoolford/domain_status/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/alexwoolford/domain_status/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/alexwoolford/domain_status/compare/v0.1.6...v0.1.10
 [0.1.6]: https://github.com/alexwoolford/domain_status/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/alexwoolford/domain_status/compare/v0.1.4...v0.1.5

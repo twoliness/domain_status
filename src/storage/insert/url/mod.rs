@@ -10,6 +10,7 @@ use sqlx::SqlitePool;
 use crate::error_handling::DatabaseError;
 
 use super::super::models::UrlRecord;
+use super::retry::with_sqlite_retry;
 use super::utils::naive_datetime_to_millis;
 
 use satellite::{
@@ -41,13 +42,14 @@ pub struct UrlRecordInsertParams<'a> {
     pub subject_alternative_names: &'a [String],
 }
 
-/// Inserts a `UrlRecord` into the database.
+/// Inserts a `UrlRecord` into the database with retry logic for transient errors.
 ///
 /// This function inserts data into:
 /// 1. The main `url_status` table (fact table with atomic fields)
 /// 2. Normalized child tables (url_technologies, url_nameservers, url_txt_records, url_mx_records, url_security_headers, url_http_headers, url_oids, url_redirect_chain)
 ///
-/// All inserts are wrapped in a transaction for atomicity.
+/// All inserts are wrapped in a transaction for atomicity. SQLITE_BUSY and SQLITE_LOCKED
+/// errors are automatically retried with exponential backoff.
 ///
 /// Note: Multi-valued fields (technologies, nameservers, txt_records, mx_records, security_headers, http_headers,
 /// oids, redirect_chain) are stored only in normalized child tables, not as JSON in the main table.
@@ -64,6 +66,12 @@ pub struct UrlRecordInsertParams<'a> {
 // Consider refactoring into smaller focused functions in Phase 4.
 #[allow(clippy::too_many_lines)]
 pub async fn insert_url_record(params: UrlRecordInsertParams<'_>) -> Result<i64, DatabaseError> {
+    with_sqlite_retry(|| insert_url_record_impl(&params)).await
+}
+
+/// Internal implementation of insert_url_record (without retry logic).
+#[allow(clippy::too_many_lines)]
+async fn insert_url_record_impl(params: &UrlRecordInsertParams<'_>) -> Result<i64, DatabaseError> {
     let valid_from_millis = naive_datetime_to_millis(params.record.ssl_cert_valid_from.as_ref());
     let valid_to_millis = naive_datetime_to_millis(params.record.ssl_cert_valid_to.as_ref());
 
